@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -35,21 +36,34 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLCDNumber,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 APP_NAME = "MKS Controller"
 BAUDRATE = 115200
-MAX_ARGON_SCCM = 4650.0
 WINDOW_SECONDS = 60
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 LOGS_DIR = BASE_DIR / "logs"
+
+DAC_FULL_SCALE_V = 3.3
+MKS_SETPOINT_FS_V = 5.0
+GCF_ARGON = 1.41
+CAPACITIES_SCCM = (10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
+DEFAULT_CAPACITY_SCCM = 5000.0
+TCP_PORT = 5000
+DEFAULT_HOST = "mks1179b.local"
+
+
+def max_argon_for_fs(fs_sccm: float) -> float:
+    return DAC_FULL_SCALE_V / MKS_SETPOINT_FS_V * fs_sccm * GCF_ARGON
 
 NUMBER = r"([-+]?\d+(?:[.,]\d+)?)"
 RE_TARGET = re.compile(r"Objetivo\s+Ar\s*:\s*" + NUMBER, re.IGNORECASE)
@@ -59,6 +73,13 @@ RE_MEASURED_ARGON = re.compile(r"Flujo\s+Medido\s*\(\s*Argon\s*\)\s*:\s*" + NUMB
 RE_EVENT_SETPOINT = re.compile(r"NUEVO\s+SET\s+POINT\s*:\s*" + NUMBER, re.IGNORECASE)
 RE_EVENT_VOLTAGE = re.compile(
     r"Voltaje\s+SetPoint\s+MKS\s*:\s*" + NUMBER, re.IGNORECASE
+)
+RE_EVENT_ZERO = re.compile(
+    r"CERO\s+CALIBRADO\s*:\s*" + NUMBER + r"\s*V", re.IGNORECASE
+)
+RE_EVENT_SPAN = re.compile(
+    r"SPAN\s+(?:ACTUAL|CALIBRADO|RESTABLECIDO)\s*:\s*K\s*=\s*" + NUMBER,
+    re.IGNORECASE,
 )
 
 STYLE = """
@@ -238,6 +259,28 @@ QPushButton#Ghost:hover {
     background-color: #16202b;
     border-color: #33465a;
 }
+QPushButton#Calibrate {
+    background-color: #0d2b34;
+    border: 1px solid #155e75;
+    color: #67e8f9;
+    font-size: 11px;
+    padding: 5px 8px;
+}
+QPushButton#Calibrate:hover {
+    background-color: #134e5a;
+    border-color: #22d3ee;
+}
+QPushButton#Link {
+    background: transparent;
+    border: none;
+    color: #67e8f9;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0;
+}
+QPushButton#Link:hover {
+    color: #a5f3fc;
+}
 QPushButton#Preset {
     background-color: #0e151d;
     border: 1px solid #263445;
@@ -294,6 +337,25 @@ QComboBox QAbstractItemView::item {
     min-height: 26px;
     padding-left: 8px;
 }
+QLineEdit {
+    background-color: #0c131b;
+    border: 1px solid #263445;
+    border-radius: 10px;
+    padding: 7px 12px;
+    min-height: 20px;
+    color: #dbe6f1;
+    selection-background-color: #0891b2;
+}
+QLineEdit:hover {
+    border-color: #33465a;
+}
+QLineEdit:focus {
+    border-color: #0891b2;
+}
+QLineEdit:disabled {
+    color: #5f7083;
+    background-color: #0b1118;
+}
 QDoubleSpinBox {
     background-color: #0c131b;
     border: 1px solid #263445;
@@ -335,6 +397,26 @@ QDoubleSpinBox::down-arrow {
     image: url("@ASSETS@/chevron-down.svg");
     width: 11px;
     height: 11px;
+}
+QDoubleSpinBox#CalSpin {
+    background-color: #0c131b;
+    border: 1px solid #263445;
+    border-radius: 9px;
+    padding: 5px 28px 5px 10px;
+    color: #dbe6f1;
+    font-size: 14px;
+    font-weight: 600;
+}
+QDoubleSpinBox#CalSpin:focus {
+    border-color: #0891b2;
+}
+QDoubleSpinBox#CalSpin::up-button {
+    width: 24px;
+    border-top-right-radius: 9px;
+}
+QDoubleSpinBox#CalSpin::down-button {
+    width: 24px;
+    border-bottom-right-radius: 9px;
 }
 QCheckBox {
     color: #cbd5e1;
@@ -550,6 +632,95 @@ class SerialWorker(QThread):
             self.connection_changed.emit(False, "")
 
 
+class TcpWorker(QThread):
+    line_received = pyqtSignal(str)
+    connection_changed = pyqtSignal(bool, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, host: str, port: int = TCP_PORT, parent=None) -> None:
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self._stop_event = threading.Event()
+        self._tx: queue.Queue[str] = queue.Queue()
+        self._socket: socket.socket | None = None
+
+    def send_command(self, command: str) -> None:
+        if self.isRunning() and not self._stop_event.is_set():
+            self._tx.put(str(command))
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        sock = self._socket
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _flush_commands(self) -> None:
+        if self._socket is None:
+            return
+        while True:
+            try:
+                command = self._tx.get_nowait()
+            except queue.Empty:
+                return
+            payload = command.strip()
+            if payload:
+                try:
+                    self._socket.sendall(f"{payload}\n".encode("utf-8"))
+                except OSError:
+                    return
+
+    def run(self) -> None:
+        try:
+            self._socket = socket.create_connection(
+                (self.host, self.port), timeout=6.0
+            )
+            self._socket.settimeout(0.2)
+            self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            self.error.emit(f"No se pudo conectar a {self.host}:{self.port}: {exc}")
+            self.connection_changed.emit(False, "")
+            return
+
+        try:
+            self.connection_changed.emit(True, f"{self.host}:{self.port}")
+            buffer = bytearray()
+            while not self._stop_event.is_set():
+                self._flush_commands()
+                try:
+                    chunk = self._socket.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    if not self._stop_event.is_set():
+                        self.error.emit(f"Se perdió la conexión con {self.host}:{self.port}: {exc}")
+                    break
+                if not chunk:
+                    if not self._stop_event.is_set():
+                        self.error.emit("El controlador cerró la conexión WiFi.")
+                    break
+                buffer.extend(chunk)
+                if len(buffer) > 32768:
+                    buffer.clear()
+                while b"\n" in buffer:
+                    raw, _, remainder = buffer.partition(b"\n")
+                    buffer = bytearray(remainder)
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        self.line_received.emit(line)
+        finally:
+            if self._socket is not None:
+                try:
+                    self._socket.close()
+                except OSError:
+                    pass
+            self._socket = None
+            self.connection_changed.emit(False, "")
+
+
 def build_icon() -> QIcon:
     pixmap = QPixmap(128, 128)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -599,6 +770,9 @@ class DashboardScroll(QScrollArea):
             max(viewport.height(), minimum.height()),
         )
 
+    def refresh_content(self) -> None:
+        self._sync_content()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._sync_content()
@@ -616,7 +790,7 @@ class MainWindow(QMainWindow):
         self.resize(1240, 820)
         self.setMinimumSize(1080, 720)
 
-        self.worker: SerialWorker | None = None
+        self.worker: SerialWorker | TcpWorker | None = None
         self.csv_logger = CsvLogger(LOGS_DIR)
         self._connected = False
         self._connecting = False
@@ -627,9 +801,17 @@ class MainWindow(QMainWindow):
         self._last_sample_monotonic: float | None = None
         self._last_port_signature: tuple[tuple[str, str], ...] | None = None
         self._command_widgets: list[QWidget] = []
+        self._last_measured_argon: float | None = None
+        self._cal_zero_text = "—"
+        self._cal_k_text = "—"
+        self._cal_measured_text = "—"
+        self._capacity_sccm = DEFAULT_CAPACITY_SCCM
+        self.max_argon_sccm = max_argon_for_fs(self._capacity_sccm)
+        self._preset_values: list[float] = []
 
         self._build_ui()
         self._apply_styles()
+        self._apply_capacity(self._capacity_sccm)
         self._reset_monitoring()
         self._refresh_ports(force=True)
         self._apply_connection_ui(False)
@@ -675,7 +857,9 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
+        left_layout.addWidget(self._build_config_card())
         left_layout.addWidget(self._build_control_card())
+        left_layout.addWidget(self._build_calibration_card())
         left_layout.addWidget(self._build_status_card())
         left_layout.addStretch(1)
 
@@ -709,14 +893,14 @@ class MainWindow(QMainWindow):
         content_widget.setObjectName("ContentArea")
         content_widget.setLayout(content)
 
-        scroll = DashboardScroll()
-        scroll.setObjectName("ContentScroll")
-        scroll.set_content(content_widget)
-        outer.addWidget(scroll, 1)
+        self.scroll = DashboardScroll()
+        self.scroll.setObjectName("ContentScroll")
+        self.scroll.set_content(content_widget)
+        outer.addWidget(self.scroll, 1)
 
         footer = QHBoxLayout()
         footer.setContentsMargins(4, 0, 4, 0)
-        self.footer_left = QLabel("MKS Controller  ·  ESP32  ·  115200 8N1")
+        self.footer_left = QLabel("MKS Controller  ·  ESP32  ·  USB / WiFi TCP")
         self.footer_left.setObjectName("Footer")
         self.footer_right = QLabel("Desconectado")
         self.footer_right.setObjectName("Footer")
@@ -750,26 +934,63 @@ class MainWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addStretch(1)
 
-        port_box = QVBoxLayout()
-        port_box.setSpacing(4)
-        port_label = QLabel("PUERTO SERIAL")
-        port_label.setObjectName("FieldHint")
-        port_row = QHBoxLayout()
-        port_row.setSpacing(8)
+        conn_box = QVBoxLayout()
+        conn_box.setSpacing(4)
+        conn_label = QLabel("CONEXIÓN")
+        conn_label.setObjectName("FieldHint")
+        conn_box.addWidget(conn_label)
+
+        conn_row = QHBoxLayout()
+        conn_row.setSpacing(8)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("WiFi", "wifi")
+        self.mode_combo.addItem("Serial", "serial")
+        self.mode_combo.setFixedSize(92, 38)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        conn_row.addWidget(self.mode_combo)
+
+        self.conn_stack = QStackedWidget()
+        self.conn_stack.setFixedHeight(38)
+        self.conn_stack.setMinimumWidth(220)
+
+        self.wifi_page = QWidget()
+        wifi_layout = QHBoxLayout(self.wifi_page)
+        wifi_layout.setContentsMargins(0, 0, 0, 0)
+        wifi_layout.setSpacing(6)
+        self.host_edit = QLineEdit(DEFAULT_HOST)
+        self.host_edit.setFixedHeight(38)
+        self.host_edit.setPlaceholderText("IP o nombre .local")
+        self.host_edit.setMinimumWidth(140)
+        self.port_edit = QLineEdit(str(TCP_PORT))
+        self.port_edit.setFixedSize(70, 38)
+        self.port_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.host_edit.returnPressed.connect(self.toggle_connection)
+        self.port_edit.returnPressed.connect(self.toggle_connection)
+        colon = QLabel(":")
+        colon.setObjectName("Muted")
+        wifi_layout.addWidget(self.host_edit, 1)
+        wifi_layout.addWidget(colon)
+        wifi_layout.addWidget(self.port_edit)
+
+        self.serial_page = QWidget()
+        serial_layout = QHBoxLayout(self.serial_page)
+        serial_layout.setContentsMargins(0, 0, 0, 0)
+        serial_layout.setSpacing(8)
         self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(270)
-        self.port_combo.setMaximumWidth(330)
         self.port_combo.setFixedHeight(38)
         self.port_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.refresh_button = QPushButton("Actualizar")
         self.refresh_button.setObjectName("Ghost")
         self.refresh_button.setFixedHeight(38)
         self.refresh_button.clicked.connect(lambda: self._refresh_ports(force=True))
-        port_row.addWidget(self.port_combo, 1)
-        port_row.addWidget(self.refresh_button)
-        port_box.addWidget(port_label)
-        port_box.addLayout(port_row)
-        layout.addLayout(port_box)
+        serial_layout.addWidget(self.port_combo, 1)
+        serial_layout.addWidget(self.refresh_button)
+
+        self.conn_stack.addWidget(self.wifi_page)
+        self.conn_stack.addWidget(self.serial_page)
+        conn_row.addWidget(self.conn_stack, 1)
+        conn_box.addLayout(conn_row)
+        layout.addLayout(conn_box)
 
         self.connect_button = QPushButton("Conectar")
         self.connect_button.setObjectName("Primary")
@@ -794,6 +1015,48 @@ class MainWindow(QMainWindow):
 
         return header
 
+    def _build_config_card(self) -> QFrame:
+        card = self._make_card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.addWidget(self._make_section_title("Controlador MKS"))
+        head.addStretch(1)
+        badge = QLabel("N2 · 5 V")
+        badge.setObjectName("Badge")
+        head.addWidget(badge)
+        layout.addLayout(head)
+
+        field_label = QLabel("CAPACIDAD DE FÁBRICA (FONDO DE ESCALA N2)")
+        field_label.setObjectName("FieldLabel")
+        layout.addWidget(field_label)
+
+        self.capacity_combo = QComboBox()
+        self.capacity_combo.setFixedHeight(38)
+        for value in CAPACITIES_SCCM:
+            self.capacity_combo.addItem(f"{value} sccm", float(value))
+        self.capacity_combo.setCurrentIndex(
+            CAPACITIES_SCCM.index(int(DEFAULT_CAPACITY_SCCM))
+        )
+        self.capacity_combo.currentIndexChanged.connect(self._on_capacity_changed)
+        layout.addWidget(self.capacity_combo)
+
+        self.capacity_hint = QLabel()
+        self.capacity_hint.setObjectName("Muted")
+        self.capacity_hint.setWordWrap(True)
+        layout.addWidget(self.capacity_hint)
+
+        note = QLabel(
+            "El rango de Argón se limita por el DAC de 3,3 V del ESP32. "
+            "Al conectar, la configuración se envía al controlador."
+        )
+        note.setStyleSheet("color:#617284; font-size:9px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return card
+
     def _build_control_card(self) -> QFrame:
         card = self._make_card()
         layout = QVBoxLayout(card)
@@ -803,9 +1066,9 @@ class MainWindow(QMainWindow):
         head = QHBoxLayout()
         head.addWidget(self._make_section_title("Control de flujo"))
         head.addStretch(1)
-        badge = QLabel("0 – 4650 sccm")
-        badge.setObjectName("Badge")
-        head.addWidget(badge)
+        self.range_badge = QLabel(f"0 – {max_argon_for_fs(DEFAULT_CAPACITY_SCCM):.0f} sccm")
+        self.range_badge.setObjectName("Badge")
+        head.addWidget(self.range_badge)
         layout.addLayout(head)
 
         field_label = QLabel("SET POINT DE ARGÓN")
@@ -813,7 +1076,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(field_label)
 
         self.spin = QDoubleSpinBox()
-        self.spin.setRange(0.0, MAX_ARGON_SCCM)
+        self.spin.setRange(0.0, max_argon_for_fs(DEFAULT_CAPACITY_SCCM))
         self.spin.setDecimals(1)
         self.spin.setSingleStep(10.0)
         self.spin.setSuffix(" sccm")
@@ -842,14 +1105,18 @@ class MainWindow(QMainWindow):
 
         preset_grid = QGridLayout()
         preset_grid.setSpacing(6)
-        for index, value in enumerate((0, 100, 500, 1000, 2500, 4650)):
-            button = QPushButton(f"{value} sccm")
+        self.preset_buttons: list[QPushButton] = []
+        for index in range(6):
+            button = QPushButton("— sccm")
             button.setObjectName("Preset")
             button.setFixedHeight(32)
             button.clicked.connect(
-                lambda _checked=False, preset=float(value): self.apply_preset(preset)
+                lambda _checked=False, position=index: self.apply_preset(
+                    self._preset_values[position]
+                )
             )
             preset_grid.addWidget(button, index // 3, index % 3)
+            self.preset_buttons.append(button)
             self._command_widgets.append(button)
         layout.addLayout(preset_grid)
 
@@ -868,6 +1135,99 @@ class MainWindow(QMainWindow):
         layout.addWidget(target_box)
 
         self._command_widgets.extend([self.set_button, self.emergency_button])
+        return card
+
+    def _build_calibration_card(self) -> QFrame:
+        card = self._make_card()
+        self.cal_card = card
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        head.addWidget(self._make_section_title("Calibración"))
+        head.addStretch(1)
+        badge = QLabel("TIEMPO REAL")
+        badge.setObjectName("Badge")
+        head.addWidget(badge)
+        self.cal_toggle_button = QPushButton("Abrir")
+        self.cal_toggle_button.setObjectName("Link")
+        self.cal_toggle_button.setFixedHeight(20)
+        self.cal_toggle_button.clicked.connect(self._toggle_calibration)
+        self.cal_toggle_button.setToolTip("Muestra u oculta los controles de calibración.")
+        head.addWidget(self.cal_toggle_button)
+        layout.addLayout(head)
+
+        self.cal_content = QWidget()
+        content_layout = QVBoxLayout(self.cal_content)
+        content_layout.setContentsMargins(0, 8, 0, 0)
+        content_layout.setSpacing(6)
+
+        self.tare_button = QPushButton("Tarar cero  ·  válvula cerrada")
+        self.tare_button.setObjectName("Ghost")
+        self.tare_button.setFixedHeight(32)
+        self.tare_button.clicked.connect(self.send_tare)
+        self.tare_button.setToolTip(
+            "Envía T al ESP32: cierra la válvula y tara el cero del sensor."
+        )
+        content_layout.addWidget(self.tare_button)
+
+        reference_label = QLabel("FLUJO REAL DE REFERENCIA")
+        reference_label.setObjectName("FieldLabel")
+        content_layout.addWidget(reference_label)
+
+        span_row = QHBoxLayout()
+        span_row.setSpacing(6)
+        self.cal_reference = QDoubleSpinBox()
+        self.cal_reference.setObjectName("CalSpin")
+        self.cal_reference.setRange(0.0, max_argon_for_fs(DEFAULT_CAPACITY_SCCM))
+        self.cal_reference.setDecimals(1)
+        self.cal_reference.setSingleStep(50.0)
+        self.cal_reference.setSuffix(" sccm")
+        self.cal_reference.setValue(round(max_argon_for_fs(DEFAULT_CAPACITY_SCCM) * 0.5, 1))
+        self.cal_reference.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.cal_reference.setKeyboardTracking(False)
+        self.cal_reference.setFixedHeight(34)
+        self.cal_reference.lineEdit().returnPressed.connect(self.send_span_calibration)
+        self.cal_span_button = QPushButton("Calibrar span")
+        self.cal_span_button.setObjectName("Calibrate")
+        self.cal_span_button.setFixedSize(112, 34)
+        self.cal_span_button.clicked.connect(self.send_span_calibration)
+        self.cal_span_button.setToolTip(
+            "Calcula K con el flujo medido actual y la referencia real."
+        )
+        span_row.addWidget(self.cal_reference, 1)
+        span_row.addWidget(self.cal_span_button)
+        content_layout.addLayout(span_row)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(8)
+        self.cal_info_label = QLabel()
+        self.cal_info_label.setObjectName("Muted")
+        self.cal_info_label.setWordWrap(True)
+        self.cal_info_label.setMinimumHeight(28)
+        self.reset_span_button = QPushButton("Restablecer K")
+        self.reset_span_button.setObjectName("Link")
+        self.reset_span_button.setFixedHeight(20)
+        self.reset_span_button.clicked.connect(self.reset_span_calibration)
+        self.reset_span_button.setToolTip("Restablece la corrección de span a 1.0.")
+        info_row.addWidget(self.cal_info_label, 1)
+        info_row.addWidget(self.reset_span_button, 0, Qt.AlignmentFlag.AlignBottom)
+        content_layout.addLayout(info_row)
+
+        hint = QLabel("Espera flujo estable antes de calibrar el span.")
+        hint.setStyleSheet("color:#617284; font-size:9px;")
+        content_layout.addWidget(hint)
+
+        layout.addWidget(self.cal_content)
+        self.cal_content.setVisible(False)
+        self._cal_expanded = False
+
+        self._command_widgets.extend(
+            [self.tare_button, self.cal_span_button, self.reset_span_button]
+        )
+        self._update_cal_info()
         return card
 
     def _build_status_card(self) -> QFrame:
@@ -1059,6 +1419,75 @@ class MainWindow(QMainWindow):
     def _apply_styles(self) -> None:
         self.setStyleSheet(STYLE.replace("@ASSETS@", ASSETS_DIR.as_posix()))
 
+    def _mode(self) -> str:
+        return self.mode_combo.currentData() or "wifi"
+
+    def _idle_footer(self) -> str:
+        if self._mode() == "wifi":
+            return "Desconectado  ·  WiFi TCP"
+        return "Desconectado  ·  115200 8N1"
+
+    def _send_device_config(self) -> None:
+        if self.worker is None:
+            return
+        self.worker.send_command(f"FS {self._capacity_sccm:.4f}")
+        self.worker.send_command(f"GCF {GCF_ARGON:.4f}")
+
+    def _apply_capacity(self, value: float) -> None:
+        self._capacity_sccm = float(value)
+        self.max_argon_sccm = max_argon_for_fs(self._capacity_sccm)
+        max_argon = self.max_argon_sccm
+
+        self.spin.blockSignals(True)
+        self.spin.setRange(0.0, max_argon)
+        self.spin.setSingleStep(10.0 if max_argon >= 100.0 else max(0.1, round(max_argon / 50.0, 1)))
+        if self.spin.value() > max_argon:
+            self.spin.setValue(max_argon)
+        self.spin.blockSignals(False)
+
+        self.range_badge.setText(f"0 – {max_argon:,.0f} sccm".replace(",", " "))
+        self.capacity_hint.setText(
+            f"Capacidad {self._capacity_sccm:.0f} sccm · rango Argón 0 – {max_argon:.0f} sccm "
+            f"· factor Ar {GCF_ARGON:.2f}"
+        )
+
+        argon_full_scale = self._capacity_sccm * GCF_ARGON
+        self.cal_reference.setRange(0.0, argon_full_scale)
+        if self.cal_reference.value() <= 0.0 or self.cal_reference.value() > argon_full_scale:
+            self.cal_reference.setValue(round(argon_full_scale * 0.5, 1))
+
+        self._preset_values = [
+            0.0,
+            round(max_argon * 0.10, 1),
+            round(max_argon * 0.25, 1),
+            round(max_argon * 0.50, 1),
+            round(max_argon * 0.75, 1),
+            round(max_argon, 1),
+        ]
+        for button, preset in zip(self.preset_buttons, self._preset_values):
+            button.setText(f"{preset:.0f}" if preset >= 100.0 else f"{preset:.1f}")
+
+        if self._connected:
+            self._send_device_config()
+
+    def _on_capacity_changed(self, _index: int) -> None:
+        value = self.capacity_combo.currentData()
+        if value is None:
+            return
+        self._apply_capacity(float(value))
+        self._set_event(
+            f"Capacidad del controlador ajustada a {float(value):.0f} sccm (N2).", "info"
+        )
+
+    def _on_mode_changed(self, _index: int) -> None:
+        self.conn_stack.setCurrentIndex(0 if self._mode() == "wifi" else 1)
+        if not self._connected and not self._connecting:
+            if self._mode() == "wifi":
+                self.connect_button.setEnabled(bool(self.host_edit.text().strip()))
+            else:
+                self.connect_button.setEnabled(self.port_combo.currentData() is not None)
+            self.footer_right.setText(self._idle_footer())
+
     def _refresh_ports(self, force: bool = False) -> None:
         try:
             ports = sorted(
@@ -1105,11 +1534,11 @@ class MainWindow(QMainWindow):
         self.port_combo.blockSignals(False)
         self._last_port_signature = items
         self.refresh_button.setToolTip(f"{len(items)} puerto(s) detectado(s)")
-        if not self._connected and not self._connecting:
+        if not self._connected and not self._connecting and self._mode() == "serial":
             self.connect_button.setEnabled(bool(items))
 
     def _auto_refresh_ports(self) -> None:
-        if not self._connected and not self._connecting:
+        if not self._connected and not self._connecting and self._mode() == "serial":
             self._refresh_ports()
 
     def _style_status(self, state: str, text: str) -> None:
@@ -1145,29 +1574,45 @@ class MainWindow(QMainWindow):
             self.connect_button.setObjectName("Ghost")
             restyle(self.connect_button)
             self.connect_button.setEnabled(False)
+            self.mode_combo.setEnabled(False)
             self.port_combo.setEnabled(False)
             self.refresh_button.setEnabled(False)
-            self.footer_right.setText("Abriendo puerto serie…")
+            self.host_edit.setEnabled(False)
+            self.port_edit.setEnabled(False)
+            self.footer_right.setText("Estableciendo conexión…")
         elif connected:
             self._style_status("connected", "CONECTADO")
             self.connect_button.setText("Desconectar")
             self.connect_button.setObjectName("Ghost")
             restyle(self.connect_button)
             self.connect_button.setEnabled(True)
+            self.mode_combo.setEnabled(False)
             self.port_combo.setEnabled(False)
             self.refresh_button.setEnabled(False)
-            port = self.port_combo.currentData() or ""
-            self.footer_right.setText(f"Conectado a {port}  ·  115200 8N1")
+            self.host_edit.setEnabled(False)
+            self.port_edit.setEnabled(False)
+            if self._mode() == "wifi":
+                host = self.host_edit.text().strip()
+                port = self.port_edit.text().strip() or str(TCP_PORT)
+                self.footer_right.setText(f"Conectado a {host}:{port}  ·  WiFi TCP")
+            else:
+                port = self.port_combo.currentData() or ""
+                self.footer_right.setText(f"Conectado a {port}  ·  115200 8N1")
         else:
             self._style_status("disconnected", "DESCONECTADO")
             self.connect_button.setText("Conectar")
             self.connect_button.setObjectName("Primary")
             restyle(self.connect_button)
-            has_port = self.port_combo.currentData() is not None
-            self.connect_button.setEnabled(has_port)
+            self.mode_combo.setEnabled(True)
             self.port_combo.setEnabled(True)
             self.refresh_button.setEnabled(True)
-            self.footer_right.setText("Desconectado  ·  115200 8N1")
+            self.host_edit.setEnabled(True)
+            self.port_edit.setEnabled(True)
+            if self._mode() == "wifi":
+                self.connect_button.setEnabled(bool(self.host_edit.text().strip()))
+            else:
+                self.connect_button.setEnabled(self.port_combo.currentData() is not None)
+            self.footer_right.setText(self._idle_footer())
 
         for widget in self._command_widgets:
             widget.setEnabled(connected)
@@ -1176,44 +1621,58 @@ class MainWindow(QMainWindow):
         if self._connecting:
             return
         if self._connected:
-            self._disconnect_serial()
+            self._disconnect()
         else:
-            self._connect_serial()
+            self._connect()
 
-    def _connect_serial(self) -> None:
-        port = self.port_combo.currentData()
-        if not port:
-            self._set_event("No hay un puerto serie seleccionado.", "warn")
-            return
+    def _connect(self) -> None:
+        if self._mode() == "wifi":
+            host = self.host_edit.text().strip()
+            if not host:
+                self._set_event("Introduce la IP o el nombre del ESP32.", "warn")
+                return
+            try:
+                port = int(self.port_edit.text().strip() or TCP_PORT)
+            except ValueError:
+                self._set_event("Puerto TCP no válido.", "warn")
+                return
+            self._clear_monitoring()
+            self._apply_connection_ui(False, connecting=True)
+            worker: SerialWorker | TcpWorker = TcpWorker(host, port, self)
+        else:
+            port_name = self.port_combo.currentData()
+            if not port_name:
+                self._set_event("No hay un puerto serie seleccionado.", "warn")
+                return
+            self._clear_monitoring()
+            self._apply_connection_ui(False, connecting=True)
+            worker = SerialWorker(port_name, BAUDRATE, self)
 
-        self._clear_monitoring()
-        self._apply_connection_ui(False, connecting=True)
-
-        worker = SerialWorker(port, BAUDRATE, self)
         self.worker = worker
         worker.line_received.connect(self._on_line)
         worker.connection_changed.connect(self._on_connection_changed)
         worker.error.connect(self._on_serial_error)
         worker.start()
 
-    def _disconnect_serial(self) -> None:
+    def _disconnect(self) -> None:
         self._manual_disconnect = True
-        self._set_event("Cerrando puerto serie…", "info")
+        self._set_event("Cerrando conexión…", "info")
         if self.worker is not None and self.worker.isRunning():
             self._style_status("connecting", "DESCONECTANDO")
             self.connect_button.setEnabled(False)
-            self.footer_right.setText("Cerrando puerto serie…")
+            self.footer_right.setText("Cerrando conexión…")
             self.worker.stop()
         else:
             self._apply_connection_ui(False)
             self._clear_monitoring()
             self._manual_disconnect = False
-            self._set_event("Puerto serie desconectado.", "info")
+            self._set_event("Desconectado.", "info")
 
     def _on_connection_changed(self, connected: bool, detail: str) -> None:
         if connected:
             self._apply_connection_ui(True)
             self._set_live_state("ESPERANDO LECTURAS", "#617284")
+            self._send_device_config()
             if self.csv_logger.active:
                 self.log_hint_label.setText("Grabando datos cada lectura…")
                 self.log_hint_label.setStyleSheet("color:#34d399; font-size:10px;")
@@ -1235,7 +1694,7 @@ class MainWindow(QMainWindow):
             self.log_hint_label.setText("Grabación en pausa · esperando conexión")
             self.log_hint_label.setStyleSheet("color:#fbbf24; font-size:10px;")
         if manual:
-            self._set_event("Puerto serie desconectado.", "info")
+            self._set_event("Desconectado.", "info")
         self._refresh_ports(force=True)
 
     def _on_serial_error(self, message: str) -> None:
@@ -1266,6 +1725,33 @@ class MainWindow(QMainWindow):
                 self._set_event(message, "ok")
             else:
                 self._set_event(line, "info")
+        elif "TARANDO CERO" in upper:
+            self._set_event("Tarando cero con la válvula cerrada…", "info")
+        elif "CERO CALIBRADO" in upper:
+            zero_match = RE_EVENT_ZERO.search(normalized)
+            if zero_match is not None:
+                zero_volts = as_float(zero_match.group(1))
+                self._cal_zero_text = f"{zero_volts:.4f}"
+                self._update_cal_info()
+                self._set_event(
+                    f"Cero calibrado con válvula cerrada: {zero_volts:.4f} V.", "ok"
+                )
+            else:
+                self._set_event("Cero calibrado con la válvula cerrada.", "ok")
+        elif any(
+            marker in upper
+            for marker in ("SPAN ACTUAL", "SPAN CALIBRADO", "SPAN RESTABLECIDO")
+        ):
+            span_match = RE_EVENT_SPAN.search(normalized)
+            if span_match is not None:
+                self._cal_k_text = f"{as_float(span_match.group(1)):.4f}"
+                self._update_cal_info()
+            if "SPAN ACTUAL" not in upper:
+                self._set_event(line, "ok")
+        elif "CONFIG" in upper or "CAPACIDAD AJUSTADA" in upper or "GCF AJUSTADO" in upper:
+            self._set_event(line, "info" if "CONFIG" in upper else "ok")
+        elif "[ERROR]" in upper:
+            self._set_event(line, "danger")
         elif "VALVULA CERRADA" in upper:
             self._device_target = 0.0
             self.target_value.setText("0.0 sccm")
@@ -1292,6 +1778,9 @@ class MainWindow(QMainWindow):
 
         if measured is not None:
             self.measured_lcd.display(f"{measured:.1f}")
+            self._last_measured_argon = measured
+            self._cal_measured_text = f"{measured:.1f}"
+            self._update_cal_info()
         if voltage is not None:
             self.voltage_lcd.display(f"{voltage:.3f}")
         if n2 is not None:
@@ -1338,6 +1827,62 @@ class MainWindow(QMainWindow):
         self.target_value.setText("0.0 sccm")
         self._set_event("Cierre de emergencia enviado · válvula cerrada.", "danger")
 
+    def _toggle_calibration(self) -> None:
+        self._cal_expanded = not self._cal_expanded
+        self.cal_content.setVisible(self._cal_expanded)
+        self.cal_toggle_button.setText("Cerrar" if self._cal_expanded else "Abrir")
+        self.cal_card.updateGeometry()
+        self.scroll.refresh_content()
+        QTimer.singleShot(0, self.scroll.refresh_content)
+
+    def send_tare(self) -> None:
+        if not self._connected or self.worker is None:
+            return
+        self.worker.send_command("T")
+        self.spin.setValue(0.0)
+        self._device_target = 0.0
+        self.target_value.setText("0.0 sccm")
+        self._cal_measured_text = "—"
+        self._update_cal_info()
+        self._set_event("Tarado de cero solicitado · válvula cerrada.", "info")
+
+    def send_span_calibration(self) -> None:
+        if not self._connected or self.worker is None:
+            return
+        measured = self._last_measured_argon
+        min_ref = max(1.0, self.max_argon_sccm * 0.01)
+        if self._device_target < min_ref or measured is None or measured < min_ref * 0.5:
+            self._set_event(
+                "Ajusta un setpoint estable antes de calibrar el span.", "warn"
+            )
+            return
+        if self._last_sample_monotonic is None or (
+            time.monotonic() - self._last_sample_monotonic > 3.0
+        ):
+            self._set_event("No hay lecturas recientes para calibrar el span.", "warn")
+            return
+        reference = round(float(self.cal_reference.value()), 1)
+        if reference < min_ref:
+            self._set_event(f"La referencia debe ser de al menos {min_ref:.0f} sccm.", "warn")
+            return
+        self.worker.send_command(f"K{reference:.1f}")
+        self._set_event(
+            f"Calibración de span solicitada · referencia {reference:.1f} sccm.",
+            "info",
+        )
+
+    def reset_span_calibration(self) -> None:
+        if not self._connected or self.worker is None:
+            return
+        self.worker.send_command("R")
+        self._set_event("Restablecimiento de span solicitado (K = 1.0).", "info")
+
+    def _update_cal_info(self) -> None:
+        self.cal_info_label.setText(
+            f"Cero: {self._cal_zero_text} V   ·   K: {self._cal_k_text}\n"
+            f"Medido: {self._cal_measured_text} sccm"
+        )
+
     def apply_preset(self, value: float) -> None:
         self.spin.setValue(value)
         self.send_setpoint()
@@ -1380,6 +1925,9 @@ class MainWindow(QMainWindow):
         self.voltage_lcd.display("0.000")
         self.n2_lcd.display("0.0")
         self.target_value.setText("—")
+        self._last_measured_argon = None
+        self._cal_measured_text = "—"
+        self._update_cal_info()
         self._set_live_state("SIN CONEXIÓN", "#617284")
 
     def _reset_monitoring(self) -> None:
